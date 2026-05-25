@@ -10,6 +10,10 @@
 - Configurable texture resolution — set texture dimensions manually for correct pixel coordinate calculation when no texture file is loaded
 - Zoom — zoom in/out on the texture canvas from 10% to 300%
 
+<p align="center">
+  <img src="Screenshot.png" width="768">
+</p>
+
 ## Requirements
 - Python 3.x
 - PyQt5
