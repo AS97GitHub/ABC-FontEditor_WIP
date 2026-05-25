@@ -22,6 +22,8 @@
 ## Usage
 ```bash
 pip install PyQt5 Pillow
+```
+```bash
 python abc_font_editor.py
 ```
 
