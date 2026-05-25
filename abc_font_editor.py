@@ -1,11 +1,12 @@
 import os
 import struct
 import json
+import re
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QLabel, QPushButton, QFileDialog, QVBoxLayout,
     QHBoxLayout, QGraphicsScene, QGraphicsView, QGraphicsPixmapItem,
     QLineEdit, QMessageBox, QComboBox, QSpinBox, QDialog, QDialogButtonBox,
-    QSizePolicy
+    QSizePolicy, QTextEdit
 )
 from PyQt5.QtGui import QPixmap, QImage, QPainter, QColor, QPen, QFont
 from PyQt5.QtCore import Qt, QRectF
@@ -23,6 +24,7 @@ class ABCFontEditor(QWidget):
         self.zoom = 1.0
         self.glyphs = []
         self.original_data = b""
+        self.dirty = False
         self.manual_offset = False  # Track if offset was set manually
         self.init_ui()
 
@@ -171,6 +173,7 @@ class ABCFontEditor(QWidget):
         self.scene.setBackgroundBrush(QColor(60, 60, 60))
         self.view = QGraphicsView(self.scene)
         self.view.setRenderHint(QPainter.Antialiasing)
+        self.view.mouseDoubleClickEvent = self.handle_view_double_click
         layout.addWidget(self.view, stretch=1)
 
         # Buttons
@@ -179,21 +182,33 @@ class ABCFontEditor(QWidget):
         self.load_abc_btn = QPushButton("Load .abc")
         self.export_json_btn = QPushButton("Export to JSON")
         self.import_json_btn = QPushButton("Import from JSON")
-        for btn in [self.load_texture_btn, self.load_abc_btn, self.export_json_btn, self.import_json_btn]:
+        self.delete_symbols_btn = QPushButton("Delete Symbols")
+        self.add_symbol_btn = QPushButton("Add Symbol")
+        self.save_abc_btn = QPushButton("Save .abc")
+        for btn in [self.load_texture_btn, self.load_abc_btn, self.export_json_btn, self.import_json_btn, self.delete_symbols_btn, self.add_symbol_btn, self.save_abc_btn]:
             btn.setStyleSheet("background-color: #333333; color: white;")
         self.export_json_btn.setEnabled(False)
         self.import_json_btn.setEnabled(False)
+        self.delete_symbols_btn.setEnabled(False)
+        self.add_symbol_btn.setEnabled(False)
+        self.save_abc_btn.setEnabled(False)
 
         bottom_row.addWidget(self.load_texture_btn)
         bottom_row.addWidget(self.load_abc_btn)
         bottom_row.addWidget(self.export_json_btn)
         bottom_row.addWidget(self.import_json_btn)
+        bottom_row.addWidget(self.delete_symbols_btn)
+        bottom_row.addWidget(self.add_symbol_btn)
+        bottom_row.addWidget(self.save_abc_btn)
         layout.addLayout(bottom_row)
 
         self.load_texture_btn.clicked.connect(self.load_texture)
         self.load_abc_btn.clicked.connect(self.load_abc)
         self.export_json_btn.clicked.connect(self.export_json)
         self.import_json_btn.clicked.connect(self.import_json)
+        self.delete_symbols_btn.clicked.connect(self.delete_symbols)
+        self.add_symbol_btn.clicked.connect(self.add_symbol)
+        self.save_abc_btn.clicked.connect(self.save_abc)
 
     def load_texture(self):
         path, _ = QFileDialog.getOpenFileName(self, "Open Texture", "", "Images (*.dds *.png)")
@@ -226,21 +241,35 @@ class ABCFontEditor(QWidget):
             self.show_error("Error", f"Failed to read ABC file:\n{str(e)}")
             return
 
-        # Determine auto_offset from header
+        # Determine table layout from header
         if len(self.original_data) < 22:
             self.show_warning("Error", "ABC file too small.")
             return
         header = self.original_data[:22]
-        self.auto_offset = int.from_bytes(header[20:22], "little") * 2
+        self.charmap_max_codepoint = int.from_bytes(header[20:22], "little")
+        self.charmap_count = self.charmap_max_codepoint + 1
+        self.charmap_offset = 22
+        self.charmap_end = self.charmap_offset + self.charmap_count * 2
+        self.auto_offset = self.charmap_end
+        if self.charmap_end + 2 > len(self.original_data):
+            self.show_warning("Error", "ABC character map exceeds file size.")
+            return
+        self.charmap = list(struct.unpack_from(f"<{self.charmap_count}H", self.original_data, self.charmap_offset))
+        self.glyph_record_count = struct.unpack_from("<H", self.original_data, self.charmap_end)[0]
+        self.glyph_to_chars = {}
+        for codepoint, glyph_index in enumerate(self.charmap):
+            if glyph_index:
+                self.glyph_to_chars.setdefault(glyph_index, []).append(codepoint)
         
         # Extract header data (bytes 4-19)
         self.glyph_height = struct.unpack("<f", self.original_data[4:8])[0]
         self.unknown_data_h1 = struct.unpack("<f", self.original_data[8:12])[0]
         self.unknown_data_h2 = struct.unpack("<f", self.original_data[12:16])[0]
         self.unknown_data_h3 = struct.unpack("<f", self.original_data[16:20])[0]
-        self.offset_dec = self.auto_offset + 26  # First glyph offset
+        self.offset_dec = self.charmap_end + 2  # First glyph offset
         self.offset_input.setText(str(self.offset_dec))
         self.manual_offset = False
+        self.dirty = False
         self.extract_glyphs(self.offset_dec, manual=False)
 
         # Update combined offset label (hidden)
@@ -248,6 +277,9 @@ class ABCFontEditor(QWidget):
 
         self.export_json_btn.setEnabled(True)
         self.import_json_btn.setEnabled(True)
+        self.delete_symbols_btn.setEnabled(True)
+        self.add_symbol_btn.setEnabled(True)
+        self.save_abc_btn.setEnabled(True)
 
     def extract_glyphs(self, offset, manual=False):
         data = self.original_data
@@ -256,8 +288,8 @@ class ABCFontEditor(QWidget):
             self.show_warning("Invalid Offset", "Offset exceeds file size.")
             return
 
-        # Always extract the service block for export/import (26 bytes total)
-        self.special_block = data[auto_offset:auto_offset+26]
+        self.special_block = data[auto_offset:auto_offset+2]
+        record_count = getattr(self, "glyph_record_count", None)
 
         # Determine start position for glyphs
         # Now offset points to first glyph, so we don't need to skip service block
@@ -265,6 +297,8 @@ class ABCFontEditor(QWidget):
         index = 0
         temp_glyphs = []
         while i + 24 <= len(data):
+            if record_count is not None and index >= record_count:
+                break
             entry = data[i:i+24]
             if len(entry) < 24:
                 break
@@ -288,6 +322,8 @@ class ABCFontEditor(QWidget):
                 "index": index,
                 "cell_width": cell_width,
                 "unknown_data": unknown_data,  # not studied
+                "chars": [chr(c) for c in self.glyph_to_chars.get(index, [])],
+                "codepoints": self.glyph_to_chars.get(index, []),
                 "uv_x_start": x0, "uv_y_start": y0, "uv_x_end": x1, "uv_y_end": y1,
                 "px_x_start": int(x0 * self.texture_size[0]),
                 "px_y_start": int(y0 * self.texture_size[1]),
@@ -300,6 +336,8 @@ class ABCFontEditor(QWidget):
             temp_glyphs.append(glyph)
             i += 24
             index += 1
+
+        self.trailing_data = data[i:]
 
         if temp_glyphs:
             self.glyphs = temp_glyphs
@@ -365,7 +403,9 @@ class ABCFontEditor(QWidget):
                 "_padding_left": "Left padding width before glyph (can be negative for kerning)",
                 "_glyph_width": "Width of the glyph/symbol in pixels",
                 "_cell_width": "Total width allocated for the glyph cell",
-                "_unknown_data": "Unknown data field (purpose not studied)"
+                "_unknown_data": "Unknown 2-byte field preserved by import/export",
+                "_chars": "Characters that map to this glyph through the ABC character map",
+                "_codepoints": "Unicode codepoints that map to this glyph"
             }
         })
         # Add global parameters
@@ -374,7 +414,12 @@ class ABCFontEditor(QWidget):
                 "glyph_height": self.glyph_height,
                 "unknown_data_h1": self.unknown_data_h1,
                 "unknown_data_h2": self.unknown_data_h2,
-                "unknown_data_h3": self.unknown_data_h3
+                "unknown_data_h3": self.unknown_data_h3,
+                "charmap_max_codepoint": getattr(self, "charmap_max_codepoint", 0),
+                "charmap_count": getattr(self, "charmap_count", 0),
+                "charmap_nonzero_count": sum(1 for v in getattr(self, "charmap", []) if v),
+                "glyph_record_count": getattr(self, "glyph_record_count", len(self.glyphs)),
+                "trailing_data_hex": getattr(self, "trailing_data", b"").hex(" ")
             }
         })
         for g in self.glyphs:
@@ -382,6 +427,8 @@ class ABCFontEditor(QWidget):
                 "index": g["index"],
                 "hex": g["hex"],
                 "unknown_data": g.get("unknown_data", 0),  # not studied
+                "chars": g.get("chars", []),
+                "codepoints": g.get("codepoints", []),
             }
             if use_uv:
                 item["uv_x_start"] = g["uv_x_start"]
@@ -406,6 +453,556 @@ class ABCFontEditor(QWidget):
             return
 
         self.show_info("Export Complete", f"Exported to:\n{export_path}")
+
+    def parse_symbol_delete_text(self, text):
+        codepoints = set()
+        token_re = re.compile(r".", re.DOTALL)
+
+        def parse_code(token):
+            try:
+                return self.parse_single_codepoint(token)
+            except ValueError:
+                return None
+
+        for raw in re.split(r"[\s,;]+", text):
+            token = raw.strip()
+            if not token:
+                continue
+
+            range_match = re.fullmatch(
+                r"(U\+[0-9A-Fa-f]{1,6}|0x[0-9A-Fa-f]{1,6}|\d+|.)-(U\+[0-9A-Fa-f]{1,6}|0x[0-9A-Fa-f]{1,6}|\d+|.)",
+                token,
+                re.DOTALL
+            )
+            if range_match:
+                start = parse_code(range_match.group(1))
+                end = parse_code(range_match.group(2))
+                if start is not None and end is not None:
+                    if start > end:
+                        start, end = end, start
+                    codepoints.update(range(start, end + 1))
+                    continue
+
+            parsed = parse_code(token)
+            if parsed is not None:
+                codepoints.add(parsed)
+                continue
+
+            for match in token_re.finditer(token):
+                char = match.group(0)
+                if char not in "\r\n\t ":
+                    parsed_char = parse_code(char)
+                    if parsed_char is not None:
+                        codepoints.add(parsed_char)
+
+        return {c for c in codepoints if 0 <= c <= 0x10FFFF}
+
+    def parse_single_codepoint(self, text):
+        token = text.strip()
+        if not token:
+            return None
+        if token.upper().startswith("U+"):
+            return int(token[2:], 16)
+        if token.lower().startswith("0x"):
+            return int(token[2:], 16)
+        if token.isdigit():
+            return int(token, 10)
+        return ord(token[0])
+
+    def parse_index_delete_text(self, text):
+        indexes = set()
+        for raw in re.split(r"[\s,;]+", text):
+            token = raw.strip()
+            if not token:
+                continue
+
+            range_match = re.fullmatch(r"(\d+)-(\d+)", token)
+            if range_match:
+                start = int(range_match.group(1))
+                end = int(range_match.group(2))
+                if start > end:
+                    start, end = end, start
+                indexes.update(range(start, end + 1))
+                continue
+
+            if token.isdigit():
+                indexes.add(int(token))
+
+        return indexes
+
+    def add_symbol(self):
+        if not self.abc_path or not self.original_data:
+            self.show_warning("Error", "Load an .abc file first.")
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Add Symbol / Glyph Index")
+        dlg.setStyleSheet("background-color: #202020; color: white;")
+        dlg.resize(380, 170)
+        layout = QVBoxLayout(dlg)
+
+        symbol_row = QHBoxLayout()
+        symbol_row.addWidget(QLabel("Symbol/codepoint:"))
+        symbol_input = QLineEdit()
+        symbol_input.setPlaceholderText("Optional: А or U+0410 or 0xC0")
+        symbol_input.setStyleSheet("background-color: #333; color: white;")
+        symbol_row.addWidget(symbol_input)
+        layout.addLayout(symbol_row)
+
+        copy_row = QHBoxLayout()
+        copy_row.addWidget(QLabel("Copy glyph index:"))
+        copy_index_input = QSpinBox()
+        copy_index_input.setRange(0, max(0, getattr(self, "glyph_record_count", len(self.glyphs)) - 1))
+        copy_index_input.setValue(0)
+        copy_index_input.setStyleSheet("QSpinBox { background-color: #333; color: white; }")
+        copy_row.addWidget(copy_index_input)
+        layout.addLayout(copy_row)
+
+        rect_row = QHBoxLayout()
+        rect_row.addWidget(QLabel("Pixel rect:"))
+        rect_input = QLineEdit()
+        rect_input.setPlaceholderText("Optional: x0 y0 x1 y1")
+        rect_input.setStyleSheet("background-color: #333; color: white;")
+        rect_row.addWidget(rect_input)
+        layout.addLayout(rect_row)
+
+        metrics_row = QHBoxLayout()
+        metrics_row.addWidget(QLabel("Metrics:"))
+        metrics_input = QLineEdit()
+        metrics_input.setPlaceholderText("Optional: padding width cell_width")
+        metrics_input.setStyleSheet("background-color: #333; color: white;")
+        metrics_row.addWidget(metrics_input)
+        layout.addLayout(metrics_row)
+
+        hint = QLabel("Leave Symbol/codepoint empty to add only a new glyph index.")
+        hint.setStyleSheet("color: #aaa;")
+        layout.addWidget(hint)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        layout.addWidget(buttons)
+
+        if dlg.exec_() != QDialog.Accepted:
+            return
+
+        old_charmap = list(getattr(self, "charmap", []))
+        symbol_text = symbol_input.text().strip()
+        codepoint = None
+        if symbol_text:
+            try:
+                codepoint = self.parse_single_codepoint(symbol_text)
+            except ValueError:
+                self.show_warning("Invalid Symbol", "Invalid symbol/codepoint value.")
+                return
+
+            if codepoint is None or not (0 <= codepoint <= 0xFFFF):
+                self.show_warning("Invalid Symbol", "ABC charmap supports codepoints from 0 to 65535.")
+                return
+
+            if codepoint < len(old_charmap) and old_charmap[codepoint] != 0:
+                self.show_warning("Already Exists", f"This symbol is already mapped to glyph index {old_charmap[codepoint]}.")
+                return
+
+        old_record_count = getattr(self, "glyph_record_count", len(self.glyphs))
+        source_index = copy_index_input.value()
+        if source_index < 0 or source_index >= old_record_count:
+            self.show_warning("Invalid Index", "Copy glyph index is outside the glyph table.")
+            return
+
+        old_records_start = getattr(self, "charmap_end", 22) + 2
+        old_records_end = old_records_start + old_record_count * 24
+        if old_records_end > len(self.original_data):
+            self.show_error("Error", "ABC glyph table exceeds file size.")
+            return
+
+        old_records = [
+            self.original_data[old_records_start + i * 24:old_records_start + (i + 1) * 24]
+            for i in range(old_record_count)
+        ]
+
+        new_record = bytearray(old_records[source_index])
+        rect_values = [v for v in re.split(r"[\s,;]+", rect_input.text().strip()) if v]
+        metrics_values = [v for v in re.split(r"[\s,;]+", metrics_input.text().strip()) if v]
+
+        if rect_values:
+            if len(rect_values) != 4:
+                self.show_warning("Invalid Rect", "Pixel rect must contain exactly 4 numbers: x0 y0 x1 y1.")
+                return
+            try:
+                px_x0, px_y0, px_x1, px_y1 = [int(v) for v in rect_values]
+            except ValueError:
+                self.show_warning("Invalid Rect", "Pixel rect values must be integer numbers.")
+                return
+            texture_width, texture_height = self.texture_size
+            if texture_width <= 0 or texture_height <= 0 or px_x1 <= px_x0 or px_y1 <= px_y0:
+                self.show_warning("Invalid Rect", "Pixel rect must fit a positive x0 y0 x1 y1 rectangle.")
+                return
+            x0 = px_x0 / texture_width
+            y0 = px_y0 / texture_height
+            x1 = px_x1 / texture_width
+            y1 = px_y1 / texture_height
+            struct.pack_into("<ffff", new_record, 2, x0, y0, x1, y1)
+
+            glyph_width = px_x1 - px_x0
+            struct.pack_into("<hHH", new_record, 18, 0, glyph_width, glyph_width)
+
+        if metrics_values:
+            if len(metrics_values) != 3:
+                self.show_warning("Invalid Metrics", "Metrics must contain exactly 3 numbers: padding width cell_width.")
+                return
+            try:
+                padding_left, glyph_width, cell_width = [int(v) for v in metrics_values]
+            except ValueError:
+                self.show_warning("Invalid Metrics", "Metric values must be integer numbers.")
+                return
+            if not (-32768 <= padding_left <= 32767 and 0 <= glyph_width <= 65535 and 0 <= cell_width <= 65535):
+                self.show_warning("Invalid Metrics", "Metric values are outside the supported range.")
+                return
+            struct.pack_into("<hHH", new_record, 18, padding_left, glyph_width, cell_width)
+
+        new_charmap = old_charmap[:]
+        if codepoint is not None and codepoint >= len(new_charmap):
+            new_charmap.extend([0] * (codepoint + 1 - len(new_charmap)))
+        if len(new_charmap) > 0x10000:
+            self.show_warning("Invalid Symbol", "ABC header cannot store a charmap larger than 65535 entries.")
+            return
+
+        new_index = old_record_count
+        if codepoint is not None:
+            new_charmap[codepoint] = new_index
+        new_record_count = old_record_count + 1
+        new_header = bytearray(self.original_data[:22])
+        struct.pack_into("<H", new_header, 20, len(new_charmap) - 1)
+
+        output = bytearray(new_header)
+        output.extend(struct.pack(f"<{len(new_charmap)}H", *new_charmap))
+        output.extend(struct.pack("<H", new_record_count))
+        for record in old_records:
+            output.extend(record)
+        output.extend(new_record)
+        output.extend(self.original_data[old_records_end:])
+
+        old_size = len(self.original_data)
+        self.original_data = bytes(output)
+        self.refresh_abc_from_memory(dirty=True)
+
+        symbol_line = "Added glyph index only"
+        if codepoint is not None:
+            display_char = chr(codepoint) if codepoint >= 32 else f"U+{codepoint:04X}"
+            symbol_line = f"Added symbol: {display_char} (U+{codepoint:04X})"
+        self.show_info(
+            "Glyph Added",
+            f"{symbol_line}\n"
+            f"New glyph index: {new_index}\n"
+            f"Copied from index: {source_index}\n"
+            f"Size in memory: {old_size} -> {len(output)} bytes\n"
+            "Use Save .abc to write the file."
+        )
+
+    def refresh_abc_from_memory(self, dirty=False):
+        header = self.original_data[:22]
+        self.charmap_max_codepoint = int.from_bytes(header[20:22], "little")
+        self.charmap_count = self.charmap_max_codepoint + 1
+        self.charmap_offset = 22
+        self.charmap_end = self.charmap_offset + self.charmap_count * 2
+        self.auto_offset = self.charmap_end
+        self.charmap = list(struct.unpack_from(f"<{self.charmap_count}H", self.original_data, self.charmap_offset))
+        self.glyph_record_count = struct.unpack_from("<H", self.original_data, self.charmap_end)[0]
+        self.glyph_to_chars = {}
+        for codepoint, glyph_index in enumerate(self.charmap):
+            if glyph_index:
+                self.glyph_to_chars.setdefault(glyph_index, []).append(codepoint)
+
+        self.glyph_height = struct.unpack("<f", self.original_data[4:8])[0]
+        self.unknown_data_h1 = struct.unpack("<f", self.original_data[8:12])[0]
+        self.unknown_data_h2 = struct.unpack("<f", self.original_data[12:16])[0]
+        self.unknown_data_h3 = struct.unpack("<f", self.original_data[16:20])[0]
+        self.offset_dec = self.charmap_end + 2
+        self.offset_input.setText(str(self.offset_dec))
+        self.manual_offset = False
+        self.dirty = dirty
+        self.save_abc_btn.setEnabled(True)
+        self.extract_glyphs(self.offset_dec, manual=False)
+        self.offsets_label.setText("")
+
+    def reload_abc_data(self, path):
+        with open(path, "rb") as f:
+            self.original_data = f.read()
+        self.refresh_abc_from_memory(dirty=False)
+
+    def save_abc(self):
+        if not self.original_data:
+            self.show_warning("No Data", "Load an .abc file first.")
+            return
+
+        save_path, _ = QFileDialog.getSaveFileName(self, "Save ABC", self.abc_path or "", "ABC Files (*.abc)")
+        if not save_path:
+            return
+
+        try:
+            with open(save_path, "wb") as f:
+                f.write(self.original_data)
+        except Exception as e:
+            self.show_error("Error", f"Failed to write ABC file:\n{str(e)}")
+            return
+
+        self.abc_path = save_path
+        self.dirty = False
+        self.show_info("Saved", f"Saved to:\n{save_path}")
+
+    def handle_view_double_click(self, event):
+        if not self.glyphs:
+            return
+
+        scene_pos = self.view.mapToScene(event.pos())
+        for glyph in reversed(self.glyphs):
+            x0 = glyph["uv_x_start"] * self.texture_size[0] * self.zoom
+            y0 = glyph["uv_y_start"] * self.texture_size[1] * self.zoom
+            x1 = glyph["uv_x_end"] * self.texture_size[0] * self.zoom
+            y1 = glyph["uv_y_end"] * self.texture_size[1] * self.zoom
+            rect = QRectF(x0, y0, x1 - x0, y1 - y0)
+            if rect.contains(scene_pos):
+                self.edit_glyph(glyph)
+                return
+
+    def edit_glyph(self, glyph):
+        if not self.original_data:
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Edit Glyph {glyph['index']}")
+        dlg.setStyleSheet("background-color: #202020; color: white;")
+        dlg.resize(420, 260)
+        layout = QVBoxLayout(dlg)
+
+        px_row = QHBoxLayout()
+        px_row.addWidget(QLabel("Pixel rect:"))
+        px_input = QLineEdit(
+            f"{glyph['px_x_start']} {glyph['px_y_start']} {glyph['px_x_end']} {glyph['px_y_end']}"
+        )
+        px_input.setStyleSheet("background-color: #333; color: white;")
+        px_row.addWidget(px_input)
+        layout.addLayout(px_row)
+
+        uv_row = QHBoxLayout()
+        uv_row.addWidget(QLabel("UV rect:"))
+        uv_input = QLineEdit(
+            f"{glyph['uv_x_start']:.9f} {glyph['uv_y_start']:.9f} {glyph['uv_x_end']:.9f} {glyph['uv_y_end']:.9f}"
+        )
+        uv_input.setStyleSheet("background-color: #333; color: white;")
+        uv_row.addWidget(uv_input)
+        layout.addLayout(uv_row)
+
+        metrics_row = QHBoxLayout()
+        metrics_row.addWidget(QLabel("Metrics:"))
+        metrics_input = QLineEdit(
+            f"{glyph['padding_left']} {glyph['glyph_width']} {glyph['cell_width']}"
+        )
+        metrics_input.setStyleSheet("background-color: #333; color: white;")
+        metrics_row.addWidget(metrics_input)
+        layout.addLayout(metrics_row)
+
+        unknown_row = QHBoxLayout()
+        unknown_row.addWidget(QLabel("Unknown:"))
+        unknown_input = QLineEdit(str(glyph.get("unknown_data", 0)))
+        unknown_input.setStyleSheet("background-color: #333; color: white;")
+        unknown_row.addWidget(unknown_input)
+        layout.addLayout(unknown_row)
+
+        chars = "".join(glyph.get("chars", []))
+        chars_label = QLabel(f"Chars: {chars if chars else '(none)'}")
+        chars_label.setStyleSheet("color: #aaa;")
+        layout.addWidget(chars_label)
+
+        hint = QLabel("Edit either Pixel rect or UV rect; Pixel rect is used when changed.")
+        hint.setStyleSheet("color: #aaa;")
+        layout.addWidget(hint)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        layout.addWidget(buttons)
+
+        if dlg.exec_() != QDialog.Accepted:
+            return
+
+        try:
+            px_values = [v for v in re.split(r"[\s,;]+", px_input.text().strip()) if v]
+            uv_values = [v for v in re.split(r"[\s,;]+", uv_input.text().strip()) if v]
+            metric_values = [v for v in re.split(r"[\s,;]+", metrics_input.text().strip()) if v]
+
+            if len(metric_values) != 3:
+                raise ValueError("Metrics must contain padding width cell_width.")
+            padding_left, glyph_width, cell_width = [int(v) for v in metric_values]
+            unknown_data = int(unknown_input.text().strip(), 0)
+
+            original_px = f"{glyph['px_x_start']} {glyph['px_y_start']} {glyph['px_x_end']} {glyph['px_y_end']}"
+            if px_input.text().strip() != original_px:
+                if len(px_values) != 4:
+                    raise ValueError("Pixel rect must contain x0 y0 x1 y1.")
+                px_x0, px_y0, px_x1, px_y1 = [int(v) for v in px_values]
+                if px_x1 <= px_x0 or px_y1 <= px_y0:
+                    raise ValueError("Pixel rect must be a positive rectangle.")
+                x0 = px_x0 / self.texture_size[0]
+                y0 = px_y0 / self.texture_size[1]
+                x1 = px_x1 / self.texture_size[0]
+                y1 = px_y1 / self.texture_size[1]
+            else:
+                if len(uv_values) != 4:
+                    raise ValueError("UV rect must contain x0 y0 x1 y1.")
+                x0, y0, x1, y1 = [float(v) for v in uv_values]
+
+            if not (0 <= unknown_data <= 0xFFFF):
+                raise ValueError("Unknown must fit uint16.")
+            if not (-32768 <= padding_left <= 32767 and 0 <= glyph_width <= 0xFFFF and 0 <= cell_width <= 0xFFFF):
+                raise ValueError("Metrics are outside supported ranges.")
+        except ValueError as e:
+            self.show_warning("Invalid Glyph Data", str(e))
+            return
+
+        record_offset = self.offset_dec + glyph["index"] * 24
+        if record_offset + 24 > len(self.original_data):
+            self.show_error("Error", "Glyph record offset exceeds file size.")
+            return
+
+        data = bytearray(self.original_data)
+        struct.pack_into("<H", data, record_offset, unknown_data)
+        struct.pack_into("<ffff", data, record_offset + 2, x0, y0, x1, y1)
+        struct.pack_into("<hHH", data, record_offset + 18, padding_left, glyph_width, cell_width)
+        self.original_data = bytes(data)
+        self.dirty = True
+        self.extract_glyphs(self.offset_dec, manual=self.manual_offset)
+
+    def delete_symbols(self):
+        if not self.abc_path or not self.original_data:
+            self.show_warning("Error", "Load an .abc file first.")
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Delete Symbols")
+        dlg.setStyleSheet("background-color: #202020; color: white;")
+        dlg.resize(520, 360)
+        layout = QVBoxLayout(dlg)
+
+        label = QLabel("Symbols/codepoints to delete:")
+        label.setStyleSheet("color: white;")
+        layout.addWidget(label)
+
+        text_edit = QTextEdit()
+        text_edit.setPlaceholderText("Examples: ABC 0-9 U+0410-U+042F 0x20AC")
+        text_edit.setStyleSheet("background-color: #333; color: white;")
+        layout.addWidget(text_edit)
+
+        hint = QLabel("Direct text, U+XXXX, 0xXXXX, decimal values, and ranges are supported.")
+        hint.setStyleSheet("color: #aaa;")
+        layout.addWidget(hint)
+
+        index_label = QLabel("Glyph indexes to delete:")
+        index_label.setStyleSheet("color: white;")
+        layout.addWidget(index_label)
+
+        index_edit = QTextEdit()
+        index_edit.setPlaceholderText("Examples: 12 15 20-30")
+        index_edit.setMaximumHeight(80)
+        index_edit.setStyleSheet("background-color: #333; color: white;")
+        layout.addWidget(index_edit)
+
+        index_hint = QLabel("Indexes are the numbers drawn on the preview/exported as JSON index.")
+        index_hint.setStyleSheet("color: #aaa;")
+        layout.addWidget(index_hint)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        layout.addWidget(buttons)
+
+        if dlg.exec_() != QDialog.Accepted:
+            return
+
+        codepoints_to_delete = self.parse_symbol_delete_text(text_edit.toPlainText())
+        glyph_indexes_to_delete = self.parse_index_delete_text(index_edit.toPlainText())
+        if not codepoints_to_delete and not glyph_indexes_to_delete:
+            self.show_warning("No Input", "Enter symbols/codepoints or glyph indexes to delete.")
+            return
+
+        old_charmap = list(getattr(self, "charmap", []))
+        old_record_count = getattr(self, "glyph_record_count", len(self.glyphs))
+        old_records_start = getattr(self, "charmap_end", 22) + 2
+        old_records_end = old_records_start + old_record_count * 24
+        if old_records_end > len(self.original_data):
+            self.show_error("Error", "ABC glyph table exceeds file size.")
+            return
+
+        mapped_deleted = [
+            codepoint for codepoint in codepoints_to_delete
+            if codepoint < len(old_charmap) and old_charmap[codepoint] != 0
+        ]
+        valid_index_deleted = {
+            index for index in glyph_indexes_to_delete
+            if 0 <= index < old_record_count
+        }
+        protected_indices = {0}
+        protected_requested = valid_index_deleted & protected_indices
+        valid_index_deleted -= protected_indices
+
+        if not mapped_deleted and not valid_index_deleted:
+            message = "No entered symbols or glyph indexes are mapped in this ABC file."
+            if protected_requested:
+                message += "\nIndex 0 is protected."
+            self.show_warning("No Matches", message)
+            return
+
+        new_charmap = old_charmap[:]
+        for codepoint in mapped_deleted:
+            new_charmap[codepoint] = 0
+        for i, value in enumerate(new_charmap):
+            if value in valid_index_deleted:
+                new_charmap[i] = 0
+
+        old_records = [
+            self.original_data[old_records_start + i * 24:old_records_start + (i + 1) * 24]
+            for i in range(old_record_count)
+        ]
+
+        keep_old_indices = {0}
+        keep_old_indices.update(value for value in new_charmap if value)
+        keep_old_indices.difference_update(valid_index_deleted)
+        keep_old_indices.update(protected_indices)
+        keep_old_indices = sorted(i for i in keep_old_indices if 0 <= i < old_record_count)
+        index_map = {old_index: new_index for new_index, old_index in enumerate(keep_old_indices)}
+
+        for i, value in enumerate(new_charmap):
+            new_charmap[i] = index_map.get(value, 0) if value else 0
+
+        while len(new_charmap) > 1 and new_charmap[-1] == 0:
+            new_charmap.pop()
+
+        new_record_count = len(keep_old_indices)
+        new_header = bytearray(self.original_data[:22])
+        struct.pack_into("<H", new_header, 20, len(new_charmap) - 1)
+
+        output = bytearray(new_header)
+        output.extend(struct.pack(f"<{len(new_charmap)}H", *new_charmap))
+        output.extend(struct.pack("<H", new_record_count))
+        for old_index in keep_old_indices:
+            output.extend(old_records[old_index])
+        output.extend(self.original_data[old_records_end:])
+
+        old_size = len(self.original_data)
+        self.original_data = bytes(output)
+        self.refresh_abc_from_memory(dirty=True)
+
+        removed_glyphs = old_record_count - new_record_count
+        removed_bytes = old_size - len(output)
+        self.show_info(
+            "Symbols Deleted",
+            f"Removed mapped symbols: {len(mapped_deleted)}\n"
+            f"Removed requested indexes: {len(valid_index_deleted)}\n"
+            f"Removed glyph records: {removed_glyphs}\n"
+            f"Size in memory: {old_size} -> {len(output)} bytes ({removed_bytes} bytes saved)\n"
+            "Use Save .abc to write the file."
+        )
 
     def import_json(self):
         if not self.abc_path or not self.original_data:
@@ -536,36 +1133,10 @@ class ABCFontEditor(QWidget):
             if valid_glyphs == 0:
                 self.show_warning("Warning", "No valid glyphs found in JSON file.")
                 return
-                
-            save_path, _ = QFileDialog.getSaveFileName(self, "Save Modified ABC", "", "ABC Files (*.abc)")
-            if not save_path:
-                return
 
-            try:
-                with open(save_path, "wb") as f:
-                    f.write(data)
-            except Exception as e:
-                self.show_error("Error", f"Failed to write ABC file:\n{str(e)}")
-                return
-
-            self.show_info("Success", "ABC file updated and saved.")
-
-            # Automatically reload the saved file after import
-            self.abc_path = save_path
-            try:
-                with open(save_path, "rb") as f:
-                    self.original_data = f.read()
-            except Exception as e:
-                self.show_error("Error", f"Failed to reload saved ABC file:\n{str(e)}")
-                return
-            # Re-run load logic
-            header = self.original_data[:22]
-            self.auto_offset = int.from_bytes(header[20:22], "little") * 2
-            self.offset_dec = self.auto_offset + 26 # First glyph offset
-            self.offset_input.setText(str(self.offset_dec))
-            self.manual_offset = False
-            self.extract_glyphs(self.offset_dec, manual=False)
-            self.offsets_label.setText("")
+            self.original_data = bytes(data)
+            self.refresh_abc_from_memory(dirty=True)
+            self.show_info("Success", f"ABC updated in memory.\nUpdated glyphs: {valid_glyphs}\nUse Save .abc to write the file.")
 
         except Exception as e:
             self.show_error("Error", f"Failed to apply changes:\n{str(e)}")
