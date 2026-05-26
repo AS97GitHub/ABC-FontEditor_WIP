@@ -1,14 +1,30 @@
 # ABC Font Editor
-### A desktop GUI tool for viewing and editing .abc binary font files from the FlatOut game series (FlatOut, FlatOut 2, FlatOut: Ultimate Carnage, FlatOut: Head On).
+### A desktop GUI tool for viewing and editing `.abc` binary font files from the FlatOut game series (FlatOut, FlatOut 2, FlatOut: Ultimate Carnage, FlatOut: Head On).
 
 ## Features
-- Load & visualize .abc font files alongside their texture atlases (.dds / .png), with glyph rectangles drawn as overlays on the texture
-- Export to JSON — dump all glyph records with UV or pixel coordinates, character mappings, padding, and width metadata
-- Import from JSON — apply edited glyph data back into memory and save as a new .abc file
-- Add / delete symbols — add new glyphs or remove existing ones by character, Unicode codepoint (U+XXXX), or hex value, with automatic charmap updates
-- Manual offset control — adjust the binary offset used to parse glyph records, useful for reverse-engineering unknown file variants
-- Configurable texture resolution — set texture dimensions manually for correct pixel coordinate calculation when no texture file is loaded
-- Zoom — zoom in/out on the texture canvas from 10% to 300%
+- Load and visualize `.abc` font files alongside their texture atlases (`.png` and supported `.dds` formats), with glyph rectangles drawn directly over the texture
+- Double-click any glyph on the texture preview to edit its coordinates and metrics
+- Export glyph tables to JSON with:
+  - UV or pixel coordinates
+  - Character mappings
+  - Unicode codepoints
+  - Padding and width metrics
+  - Global/header parameters (WIP)
+- Import edited JSON data back into memory and save as a new `.abc` file
+- Add new glyphs and symbols by:
+  - Character
+  - Unicode notation (`U+XXXX`)
+  - Hexadecimal values (`0xXXXX`)
+  - Decimal codepoints
+- Delete symbols or glyph indexes with automatic:
+  - Charmap rebuilding
+  - Glyph index remapping
+  - Glyph table cleanup
+  - Header updates
+- Configurable texture resolution for correct pixel coordinate calculation even without a texture file
+- Zoom support from 10% to 300%
+- Glyph index overlay visualization directly on the texture
+- All modifications are applied in memory until **Save .abc** is used
 
 <p align="center">
   <img src="Screenshot.png" width="768">
@@ -19,25 +35,44 @@
 - PyQt5
 - Pillow
 
-## Usage
+## Installation
 ```bash
 pip install PyQt5 Pillow
 ```
+## Usage
 ```bash
 python abc_font_editor.py
 ```
 
 ## Usage Examples
 1. Viewing a font file
-    1. Click Load Texture and open the font texture (e.g. hud_numbers.dds)
-    2. Click Load .abc and open the matching font file (e.g. hud_numbers.abc)
-    3. Green rectangles will appear on the texture, each marking a glyph's position. The glyph index is shown in the top-left corner of each rectangle.
+    1. Click **Load Texture** and open the font texture (example: `hud_numbers.dds`)
+    2. Click **Load .abc** and open the matching font file (example: `hud_numbers.abc`)
+    3. Green rectangles will appear on the texture, each marking a glyph position
+    4. The glyph index is displayed in the top-left corner of each rectangle
 
-2. Exporting glyph data for editing
-    1. Load the .abc file (texture is optional)
-    2. Click Export to JSON
-    3. Choose coordinate format — UV (normalized 0.0–1.0) or Pixel (absolute pixels)
-    4. Save the .json file and open it in any text editor
+2. Editing glyphs directly
+    1. Load a texture and `.abc` file
+    2. Double-click any glyph rectangle on the preview
+    3. Edit:
+       - Pixel coordinates
+       - UV coordinates
+       - Padding
+       - Glyph width
+       - Cell width
+       - Unknown data field
+    4. Confirm the changes
+    5. Click **Save .abc** to write changes to disk
+   
+
+
+3. Exporting glyph data to JSON
+   1. Load the `.abc` file (texture optional)
+   2. Click **Export to JSON**
+   3. Choose export format:
+      - UV coordinates (0.0–1.0)
+      - Pixel coordinates
+   4. Save the `.json` file
 
 Example exported glyph entry:
 ```json
@@ -54,26 +89,51 @@ Example exported glyph entry:
     "cell_width": 17
 }
 ```
-3. Importing edited glyphs back
-    1. Edit the exported .json file (e.g. adjust px_x_start / px_x_end to remap a glyph to a new position on the texture)
-    2. Click Import from JSON and select your edited file
-    3. Click Save .abc to write the result to disk
 
-4. Adding a new symbol
-    1. Load an .abc file
-    2. Click Add Symbol
-    3. Enter the character or codepoint (e.g. Ж or U+0416) and fill in the pixel coordinates and width values
-    4. Click Save .abc to save
+4. Importing edited glyphs
+    1. Edit the exported `.json` file
+    2. Click **Import from JSON**
+    3. Select the modified JSON file
+    4. Click **Save .abc** to write changes to disk
 
-5. Deleting symbols
-    1. Load an .abc file
-    2. Click Delete Symbols
-    3. Enter the characters or codepoints to remove — you can use:
-        - Single characters: A B C
-        - Unicode notation: U+0041 U+0042
-        - Ranges: A-Z or U+0041-U+005A
-    4. Confirm — the charmap and glyph table will be updated automatically
-    5. Click Save .abc to save
+5. Adding a new symbol
+    1. Load an `.abc` file
+    2. Click **Add Symbol**
+    3. Enter:
+       - Character or codepoint (`Ж`, `U+0416`, `0x416`, etc.)
+       - Source glyph index to copy
+       - Optional coordinates and metrics
+    4. Confirm the operation
+    5. Click **Save .abc**
 
-6. Working without a texture
-If you don't have the texture file, you can still load and edit the .abc data. Set the correct texture resolution manually (e.g. 2048 x 1024) and click Apply — pixel coordinates will be calculated correctly for export
+6. Deleting symbols or glyph indexes
+    1. Load an `.abc` file
+    2. Click **Delete Symbols**
+    3. Enter characters, codepoints, or glyph indexes
+    Supported formats:
+       - Characters:
+         `A B C`
+       - Unicode:
+         `U+0041 U+0042`
+       - Hexadecimal:
+         `0x41 0x42`
+       - Ranges:
+        ` A-Z
+         U+0410-U+042F`
+       - Glyph indexes:
+         `12 15 20-30`
+    4. Confirm deletion
+    5. The program automatically rebuilds the glyph table and charmap
+    6. Click **Save .abc**
+
+7. Working without a texture
+If the texture file is unavailable
+    1. Load the `.abc` file only
+    2. Enter the correct texture resolution manually (example: `512 x 512`)
+    3. Click **Apply**
+    4. Pixel coordinate conversion and JSON export/import will still work correctly
+
+## Notes
+- Glyph index `0` is protected and cannot be deleted
+- Changes are stored in memory until explicitly saved
+- `.dds` loading depends on Pillow DDS support
