@@ -22,7 +22,7 @@
   - Glyph table cleanup
   - Header updates
 - Configurable texture resolution for correct pixel coordinate calculation even without a texture file
-- Zoom support from 10% to 300%
+- Zoom support from 5% to 300%
 - Glyph index overlay visualization directly on the texture
 - All modifications are applied in memory until **Save .abc** is used
 
@@ -40,6 +40,11 @@
 pip install PyQt5 Pillow
 ```
 ## Usage
+
+> ⚠️ On Windows, you can use either `python` or `py` to run the script, depending on your Python installation.
+
+> ⚠️ On Linux you may need to use `python3` instead of `python`.
+
 ```bash
 python abc_font_editor.py
 ```
